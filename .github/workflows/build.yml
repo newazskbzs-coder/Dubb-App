@@ -1,0 +1,227 @@
+name: Build Dubbing APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create Flutter Project & Setup Code
+        run: |
+          flutter create dubbing_app
+          cd dubbing_app
+
+          # ফাইল পিকার ও অন্যান্য প্যাকেজ অ্যাড করা
+          flutter pub add video_player flutter_tts translator file_picker
+
+          # পারমিশন অ্যাড করা
+          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"\/>' android/app/src/main/AndroidManifest.xml
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:video_player/video_player.dart';
+          import 'package:flutter_tts/flutter_tts.dart';
+          import 'package:translator/translator.dart';
+          import 'package:file_picker/file_picker.dart';
+
+          void main() => runApp(const MaterialApp(home: LocalVideoDubber()));
+
+          class SubtitleEntry {
+            final Duration start;
+            final Duration end;
+            final String text;
+            SubtitleEntry({required this.start, required this.end, required this.text});
+          }
+
+          class LocalVideoDubber extends StatefulWidget {
+            const LocalVideoDubber({super.key});
+
+            @override
+            State<LocalVideoDubber> createState() => _LocalVideoDubberState();
+          }
+
+          class _LocalVideoDubberState extends State<LocalVideoDubber> {
+            VideoPlayerController? _controller;
+            final FlutterTts _tts = FlutterTts();
+            final GoogleTranslator _translator = GoogleTranslator();
+
+            List<SubtitleEntry> _subtitles = [];
+            String _currentSub = "ভিডিও ও সাবটাইটেল সিলেক্ট করুন";
+            String _currentHindi = "";
+            int _lastIndex = -1;
+
+            @override
+            void initState() {
+              super.initState();
+              _tts.setLanguage("hi-IN");
+              _tts.setPitch(1.0);
+              _tts.setSpeechRate(0.85);
+            }
+
+            // ফোন থেকে ভিডিও সিলেক্ট করা
+            Future<void> _pickVideo() async {
+              FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.video);
+              if (result != null && result.files.single.path != null) {
+                _controller?.dispose();
+                _controller = VideoPlayerController.file(File(result.files.single.path!))
+                  ..initialize().then((_) {
+                    setState(() {});
+                    _controller!.play();
+                  });
+                _controller!.addListener(_syncSubtitles);
+              }
+            }
+
+            // ফোন থেকে .srt সাবটাইটেল ফাইল সিলেক্ট ও রিড করা
+            Future<void> _pickSubtitle() async {
+              FilePickerResult? result = await FilePicker.platform.pickFiles(
+                type: FileType.any,
+              );
+              if (result != null && result.files.single.path != null) {
+                File file = File(result.files.single.path!);
+                String content = await file.readAsString();
+                _parseSrt(content);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text("সাবটাইটেল ফাইল লোড হয়েছে!")),
+                );
+              }
+            }
+
+            // .srt পার্স করার লজিক
+            void _parseSrt(String srtContent) {
+              _subtitles.clear();
+              List<String> blocks = srtContent.replaceAll('\r\n', '\n').split('\n\n');
+              for (var block in blocks) {
+                var lines = block.trim().split('\n');
+                if (lines.length >= 3 && lines[1].contains('-->')) {
+                  var times = lines[1].split('-->');
+                  Duration start = _parseDuration(times[0].trim());
+                  Duration end = _parseDuration(times[1].trim());
+                  String text = lines.sublist(2).join(' ');
+                  _subtitles.add(SubtitleEntry(start: start, end: end, text: text));
+                }
+              }
+            }
+
+            Duration _parseDuration(String timeStr) {
+              var parts = timeStr.replaceAll(',', '.').split(':');
+              int h = int.parse(parts[0]);
+              int m = int.parse(parts[1]);
+              var secParts = parts[2].split('.');
+              int s = int.parse(secParts[0]);
+              int ms = int.parse(secParts[1].padRight(3, '0').substring(0, 3));
+              return Duration(hours: h, minutes: m, seconds: s, milliseconds: ms);
+            }
+
+            void _syncSubtitles() async {
+              if (_controller == null || !_controller!.value.isPlaying) return;
+
+              final pos = _controller!.value.position;
+              for (int i = 0; i < _subtitles.length; i++) {
+                final item = _subtitles[i];
+                if (pos >= item.start && pos <= item.end) {
+                  if (_lastIndex != i) {
+                    _lastIndex = i;
+                    setState(() => _currentSub = item.text);
+
+                    var translated = await _translator.translate(item.text, to: 'hi');
+                    setState(() => _currentHindi = translated.text);
+
+                    await _tts.stop();
+                    await _tts.speak(translated.text);
+                  }
+                  return;
+                }
+              }
+            }
+
+            @override
+            void dispose() {
+              _controller?.dispose();
+              _tts.stop();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text("My Video Hindi Dubber")),
+                body: SingleChildScrollView(
+                  child: Column(
+                    children: [
+                      if (_controller != null && _controller!.value.isInitialized)
+                        AspectRatio(
+                          aspectRatio: _controller!.value.aspectRatio,
+                          child: VideoPlayer(_controller!),
+                        )
+                      else
+                        Container(
+                          height: 200,
+                          color: Colors.black12,
+                          child: const Center(child: Text("ভিডিও লোড করা হয়নি")),
+                        ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.video_library),
+                            label: const Text("Select Video"),
+                            onPressed: _pickVideo,
+                          ),
+                          const SizedBox(width: 10),
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.subtitles),
+                            label: const Text("Select .SRT"),
+                            onPressed: _pickSubtitle,
+                          ),
+                        ],
+                      ),
+                      const Divider(height: 30),
+                      Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("Subtitles:", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+                            Text(_currentSub, style: const TextStyle(fontSize: 16)),
+                            const SizedBox(height: 16),
+                            const Text("Hindi Voice Text:", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.green)),
+                            Text(_currentHindi, style: const TextStyle(fontSize: 18, color: Colors.blueAccent, fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                      )
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build Android Release APK
+        run: |
+          cd dubbing_app
+          flutter build apk --release
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dubbing-App-APK
+          path: dubbing_app/build/app/outputs/flutter-apk/app-release.apk
